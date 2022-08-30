@@ -138,7 +138,9 @@ fn main() -> Result<(), Error> {
         }
     }
 
-    let f = File::create(OUTPUT_FILE).map_err(|_| Error::SignatureFileCreation)?;
+    let output_file = env::args().nth(3).unwrap_or(OUTPUT_FILE.to_string());
+
+    let f = File::create(output_file).map_err(|_| Error::SignatureFileCreation)?;
     let writer = BufWriter::new(f);
 
     // The JS version uses tabs for pretty printing JSON for some reason
