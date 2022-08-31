@@ -6,10 +6,14 @@ use std::{
     fs::File,
     io::BufWriter,
     path::Path,
+    sync::Arc,
     sync::mpsc::channel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use swc_common::{self, SourceMap};
+use swc_ecma_visit::{noop_visit_type, Visit, VisitWith};
+use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsConfig};
 use threadpool::ThreadPool;
 use walkdir::WalkDir;
 
@@ -17,6 +21,21 @@ const SIGNING_KEY: &str = "SIGNING_KEY";
 const OUTPUT_FILE: &str = "signatures.json";
 const GRAPHQL_SUFFIX: &str = ".graphql.ts";
 const CONCRETE_REQUEST: &str = "ConcreteRequest";
+
+#[derive(Debug, Clone, Copy)]
+enum Strategy {
+    Manual,
+    Swc,
+}
+
+impl From<String> for Strategy {
+    fn from(s: String) -> Self {
+        match &*s {
+            "swc" | "SWC" | "Swc" => Self::Swc,
+            _ => Self::Manual,
+        }
+    }
+}
 
 #[derive(Debug)]
 enum Error {
@@ -34,7 +53,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 struct Params {
     #[serde(rename = "cacheID")]
     cache_id: String,
@@ -46,12 +65,13 @@ struct Params {
     text: String,
 }
 
-fn compute_digest<P: AsRef<Path>>(filepath: P, key: ring::hmac::Key) -> Result<Option<(Tag, String)>, Error> {
-    let contents = std::fs::read_to_string(filepath)?;
-
-    let digest = match find_params(&contents) {
-        Some(raw_params) => {
-            let params: Params = serde_json::from_str(&raw_params).map_err(|_| Error::ParamSerialization)?;
+fn compute_digest<P: AsRef<Path>>(filepath: P, key: ring::hmac::Key, strategy: Strategy) -> Result<Option<(Tag, String)>, Error> {
+    let params = match strategy {
+        Strategy::Swc => get_params_swc(filepath),
+        Strategy::Manual => get_params(filepath),
+    };
+    let digest = match params? {
+        Some(params) => {
             let tag = ring::hmac::sign(&key, (&params.text).as_bytes());
             Some((tag, params.name))
         }
@@ -67,6 +87,94 @@ fn is_graphql<P: AsRef<Path>>(filepath: P) -> bool {
         .file_name()
         .map(|s| s.to_string_lossy().ends_with(GRAPHQL_SUFFIX))
         .unwrap_or(false)
+}
+
+fn get_params<P: AsRef<Path>>(filepath: P) -> Result<Option<Params>, Error> {
+    let contents = std::fs::read_to_string(filepath)?;
+
+    let params = match find_params(&contents) {
+        Some(raw_params) => {
+            let params: Params = serde_json::from_str(&raw_params).map_err(|_| Error::ParamSerialization)?;
+            Some(params)
+        }
+        None => None
+    };
+    Ok(params)
+}
+
+#[derive(Default)]
+struct MyCollector {
+    params: bool,
+    name: String,
+    text: String,
+    done: i32,
+}
+impl Visit for MyCollector {
+    noop_visit_type!();
+
+    fn visit_key_value_prop(&mut self, n: &swc_ecma_ast::KeyValueProp) {
+        if self.done == 2 {
+            return
+        }
+        match &n.key {
+            swc_ecma_ast::PropName::Str(s) => {
+                if self.params {
+                    if s.raw.as_deref() == Some("\"name\"") {
+                        match &*n.value {
+                            swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(ss)) => {
+                                //self.name = ss.value.as_deref().unwrap().trim_matches('"').to_owned();
+                                self.name = ss.value.to_string();
+                                self.done += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if s.raw.as_deref() == Some("\"text\"") {
+                        match &*n.value {
+                            swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(ss)) => {
+                                self.text = ss.value.to_string();
+                                self.done += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if s.raw.as_deref() == Some("\"params\"") {
+                    self.params = true;
+                }
+            }
+            _ => println!("Unknown key {:?}", n.key),
+        }
+        n.visit_children_with(self);
+    }
+}
+
+fn get_params_swc<P: AsRef<Path>>(filepath: P) -> Result<Option<Params>, Error> {
+    let cm: Arc<SourceMap> = Default::default();
+    let fm = cm.load_file(filepath.as_ref()).unwrap();
+    let lexer = Lexer::new(
+        Syntax::Typescript(TsConfig {
+            no_early_errors: true,
+            tsx: false,
+            ..Default::default()
+        }),
+        Default::default(),
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut parser = Parser::new_from(lexer);
+    let module = parser.parse_typescript_module().unwrap();
+    let mut visitor = MyCollector::default();
+    module.visit_with(&mut visitor);
+    if !visitor.params || visitor.done < 2 {
+        return Ok(None);
+    }
+    Ok(Some(Params {
+        name: visitor.name,
+        text: visitor.text,
+        ..Default::default()
+    }
+    ))
 }
 
 fn find_params(contents: &String) -> Option<String> {
@@ -114,6 +222,9 @@ fn main() -> Result<(), Error> {
 
     let key = ring::hmac::Key::new(HMAC_SHA256, signing_key.as_bytes());
 
+    let output_file = env::args().nth(3).unwrap_or(OUTPUT_FILE.to_string());
+    let strategy: Strategy = env::args().nth(4).unwrap_or("swc".to_string()).into();
+
     for entry in WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
@@ -123,7 +234,7 @@ fn main() -> Result<(), Error> {
             let tx = tx.clone();
             let key = key.clone();
             pool.execute(move || {
-                let digest = compute_digest(path, key);
+                let digest = compute_digest(path, key, strategy);
                 tx.send(digest).expect("Could not send data!");
             });
         }
@@ -138,7 +249,6 @@ fn main() -> Result<(), Error> {
         }
     }
 
-    let output_file = env::args().nth(3).unwrap_or(OUTPUT_FILE.to_string());
 
     let f = File::create(output_file).map_err(|_| Error::SignatureFileCreation)?;
     let writer = BufWriter::new(f);
